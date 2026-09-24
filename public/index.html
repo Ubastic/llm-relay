@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Key 中转池</title>
+<style>
+  :root { --bg:#0e1116; --card:#161b23; --card2:#1c222d; --line:#263041; --txt:#dbe4f0; --dim:#8494ab; --acc:#4f8cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:14px/1.6 system-ui,"Segoe UI","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:1080px; margin:0 auto; padding:24px 20px 60px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  h3 { margin:0; font-size:15px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .sub { color:var(--dim); font-size:13px; }
+  .hint { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 14px; margin:14px 0; font-size:13px; color:var(--dim); }
+  .hint code { color:var(--acc); background:#0a0d12; padding:1px 6px; border-radius:5px; font-size:12px; }
+  button { background:var(--card2); color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:5px 12px; cursor:pointer; font-size:13px; }
+  button:hover { border-color:var(--acc); }
+  button.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
+  button.danger:hover { border-color:#e05c5c; color:#e05c5c; }
+  input, select, textarea { background:#0a0d12; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:7px 10px; font-size:13px; font-family:inherit; }
+  input:focus, select:focus, textarea:focus { outline:none; border-color:var(--acc); }
+  textarea { width:100%; min-height:110px; resize:vertical; font-family:Consolas,monospace; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 18px; margin:14px 0; }
+  .url { color:var(--dim); font-size:12px; font-family:Consolas,monospace; word-break:break-all; }
+  .badge { font-size:11px; padding:1px 8px; border-radius:20px; border:1px solid var(--line); color:var(--dim); }
+  .badge.openai { color:#7fd18c; border-color:#2c5c3a; }
+  .badge.anthropic { color:#e0a33c; border-color:#6b5426; }
+  .mdl { font-size:11px; color:var(--acc); background:#10182a; border-radius:5px; padding:1px 6px; margin-right:4px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin-top:10px; }
+  th { text-align:left; color:var(--dim); font-weight:normal; font-size:12px; padding:4px 8px; border-bottom:1px solid var(--line); }
+  td { padding:5px 8px; border-bottom:1px solid #1d2430; vertical-align:top; }
+  tr:last-child td { border-bottom:none; }
+  .chip { display:inline-block; font-size:11px; padding:1px 9px; border-radius:20px; white-space:nowrap; }
+  .chip.alive { background:#12291c; color:#5fd68f; }
+  .chip.cooldown { background:#2e2410; color:#eab958; }
+  .chip.exhausted { background:#2e1414; color:#ef7b7b; }
+  .chip.invalid { background:#2e1414; color:#d96a6a; }
+  .chip.disabled { background:#1c222d; color:#77839a; }
+  .kerr { color:var(--dim); font-size:12px; max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .stat-ok { color:#5fd68f; } .stat-fail { color:#e05c5c; }
+  .editor { display:none; }
+  .editor.open { display:block; }
+  label.f { display:block; font-size:12px; color:var(--dim); margin:10px 0 4px; }
+  .iw { width:100%; }
+  #log td { font-size:12px; font-family:Consolas,monospace; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="row" style="justify-content:space-between">
+    <div>
+      <h1>🔑 LLM Key 中转池</h1>
+      <div class="sub" id="sub">加载中…</div>
+    </div>
+    <div class="row">
+      <input id="pk" placeholder="proxyKey（客户端访问密钥，可留空）" style="width:250px">
+      <button id="btn-settings" class="primary">保存设置</button>
+      <button id="btn-add">＋ 添加平台</button>
+    </div>
+  </div>
+
+  <div class="hint">
+    接入：OpenAI 格式（codex / zcode / 各类客户端）→ base_url 填 <code id="h-openai"></code>；
+    Claude 格式（Claude Code）→ 环境变量 <code>ANTHROPIC_BASE_URL=<span id="h-claude"></span></code>。
+    模型名照常填写，本服务按模型路由平台、按 key 池轮换。无余额/无效 key 自动剔除并换下一个。
+  </div>
+
+  <div class="card editor" id="editor">
+    <h3 id="editor-title">添加平台</h3>
+    <div class="row" style="margin-top:6px">
+      <div style="flex:1;min-width:180px"><label class="f">平台名称</label><input id="f-name" class="iw" placeholder="如 tokenrhythm / anthropic官方"></div>
+      <div style="flex:2;min-width:260px"><label class="f">Base URL</label><input id="f-url" class="iw" placeholder="https://xxx.com/v1 （不带 /v1 也行，自动补）"></div>
+      <div style="min-width:180px"><label class="f">上游协议</label><select id="f-proto" class="iw"><option value="openai">OpenAI（/chat/completions）</option><option value="anthropic">Anthropic（/v1/messages）</option></select></div>
+    </div>
+    <div class="row" style="margin-top:2px">
+      <div style="flex:2;min-width:260px"><label class="f">限定模型（逗号分隔，留空 = 兜底接住所有模型）</label><input id="f-models" class="iw" placeholder="gpt-4o, gpt-4o-mini"></div>
+      <div style="flex:1;min-width:150px"><label class="f">测试用模型（可选）</label><input id="f-test" class="iw" placeholder="默认取第一个限定模型"></div>
+    </div>
+    <label class="f">API Keys —— 一行一个，可整段粘贴（自动去重；已存在的 key 保留状态）</label>
+    <textarea id="f-keys" placeholder="sk-xxxx&#10;sk-yyyy&#10;sk-zzzz"></textarea>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" id="btn-save-platform">保存平台</button>
+      <button id="btn-cancel">取消</button>
+      <span class="sub" id="editor-msg"></span>
+    </div>
+  </div>
+
+  <div id="platforms"></div>
+
+  <div class="card">
+    <h3>最近请求 <span class="sub" id="stat"></span></h3>
+    <table id="log"><thead><tr><th>时间</th><th>模型</th><th>平台</th><th>Key</th><th>耗时</th><th>结果</th></tr></thead><tbody></tbody></table>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let state = null, editId = null;
+
+const hdrs = () => { const h = { 'content-type': 'application/json' }; const k = localStorage.getItem('relayAdminKey'); if (k) h['x-admin-key'] = k; return h; };
+async function api(path, body, method) {
+  const r = await fetch('/admin/api' + path, { method: method || (body ? 'POST' : 'GET'), headers: hdrs(), body: body ? JSON.stringify(body) : undefined });
+  if (r.status === 401) {
+    const k = prompt('请输入访问密钥（proxyKey）');
+    if (k != null) { localStorage.setItem('relayAdminKey', k); return api(path, body, method); }
+    throw new Error('需要访问密钥');
+  }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+function ago(t) { if (!t) return '—'; const s = (Date.now() - t) / 1000 | 0; if (s < 60) return s + '秒前'; if (s < 3600) return (s / 60 | 0) + '分钟前'; if (s < 86400) return (s / 3600 | 0) + '小时前'; return (s / 86400 | 0) + '天前'; }
+const CHIP = { alive: '可用', cooldown: '冷却中', exhausted: '无余额', invalid: '无效', disabled: '已停用' };
+
+function render() {
+  const nk = state.platforms.reduce((n, p) => n + p.keys.length, 0);
+  $('#sub').textContent = 'http://localhost:' + state.port + ' · ' + state.platforms.length + ' 个平台 · ' + nk + ' 个 key';
+  $('#h-openai').textContent = 'http://localhost:' + state.port + '/v1';
+  $('#h-claude').textContent = 'http://localhost:' + state.port;
+  $('#pk').value = state.proxyKey || '';
+  $('#stat').textContent = '成功 ' + state.stats.ok + ' / 失败 ' + state.stats.fail;
+  $('#platforms').innerHTML = state.platforms.map(platformCard).join('') || '<div class="card sub">还没有平台，点右上角「＋ 添加平台」</div>';
+  $('#log tbody').innerHTML = (state.log || []).slice(0, 50).map(r =>
+    '<tr><td>' + new Date(r.t).toLocaleTimeString('zh-CN') + '</td><td>' + esc(r.model) + '</td><td>' + esc(r.platform) + '</td><td>' + esc(r.key) + '</td><td>' + r.ms + 'ms</td><td>' +
+    (r.ok ? '<span class="stat-ok">✓ 成功</span>' : '<span class="stat-fail">✗ ' + esc((r.msg || '失败').slice(0, 80)) + '</span>') + '</td></tr>'
+  ).join('') || '<tr><td colspan="6" class="sub">暂无请求</td></tr>';
+}
+
+function platformCard(p) {
+  const cnt = {};
+  p.keys.forEach(k => cnt[k.status] = (cnt[k.status] || 0) + 1);
+  const cntStr = Object.keys(cnt).map(s => CHIP[s] + ' ' + cnt[s]).join(' · ') || '无 key';
+  return '<div class="card" data-pid="' + p.id + '">'
+    + '<h3>' + esc(p.name)
+    + ' <span class="badge ' + p.protocol + '">' + (p.protocol === 'anthropic' ? 'Anthropic 协议' : 'OpenAI 协议') + '</span>'
+    + ' <span class="sub">' + cntStr + '</span><span style="flex:1"></span>'
+    + '<button data-act="edit">编辑</button><button data-act="reset">重置失效</button><button data-act="del" class="danger">删除</button></h3>'
+    + '<div class="url">' + esc(p.baseUrl) + '</div>'
+    + '<div style="margin-top:6px">' + (p.models.length ? p.models.map(m => '<span class="mdl">' + esc(m) + '</span>').join('') : '<span class="sub">未限定模型（兜底接住所有模型）</span>') + '</div>'
+    + '<table><thead><tr><th>Key</th><th>状态</th><th>最近错误</th><th>最近使用</th><th style="width:150px">操作</th></tr></thead><tbody>'
+    + (p.keys.length ? p.keys.map(k =>
+        '<tr><td style="font-family:Consolas,monospace">' + esc(k.mask) + '</td>'
+        + '<td><span class="chip ' + k.status + '">' + CHIP[k.status] + '</span></td>'
+        + '<td class="kerr" title="' + esc(k.lastError) + '">' + esc(k.lastError || '—') + '</td>'
+        + '<td class="sub">' + ago(k.lastUsed) + '</td>'
+        + '<td>' + opBtns(k) + '</td></tr>').join('')
+      : '<tr><td colspan="5" class="sub">还没有 key，点「编辑」粘贴</td></tr>')
+    + '</tbody></table></div>';
+}
+function opBtns(k) {
+  const t = (k.status === 'alive' || k.status === 'cooldown') ? '<button data-act="kdisable" data-i="' + k.i + '">停用</button>' : '<button data-act="kenable" data-i="' + k.i + '">启用</button>';
+  return t + ' <button data-act="ktest" data-i="' + k.i + '">测试</button>';
+}
+
+document.addEventListener('click', async e => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const card = btn.closest('[data-pid]');
+  const pid = card && card.dataset.pid;
+  const act = btn.dataset.act;
+  try {
+    if (act === 'edit') return openEditor(pid);
+    if (act === 'del') { if (confirm('删除该平台及其所有 key？')) { await api('/platform/delete', { id: pid }); refresh(); } return; }
+    if (act === 'reset') { await api('/platform/reset-failed', { id: pid }); refresh(); return; }
+    if (act === 'kdisable') { await api('/key/op', { pid, i: +btn.dataset.i, op: 'disable' }); refresh(); return; }
+    if (act === 'kenable') { await api('/key/op', { pid, i: +btn.dataset.i, op: 'enable' }); refresh(); return; }
+    if (act === 'ktest') {
+      btn.disabled = true; btn.textContent = '测试中…';
+      try { const r = await api('/key/op', { pid, i: +btn.dataset.i, op: 'test' }); btn.textContent = r.ok ? '✓ ' + r.ms + 'ms' : '✗ 失败'; btn.title = r.msg; }
+      catch (err) { btn.textContent = '✗ ' + err.message.slice(0, 16); }
+      btn.disabled = false; setTimeout(refresh, 300); return;
+    }
+  } catch (err) { alert(err.message); }
+});
+
+async function openEditor(pid) {
+  editId = pid || null;
+  $('#editor-msg').textContent = '';
+  if (pid) {
+    const p = await api('/platform?id=' + encodeURIComponent(pid));
+    $('#editor-title').textContent = '编辑平台：' + p.name;
+    $('#f-name').value = p.name; $('#f-url').value = p.baseUrl; $('#f-proto').value = p.protocol;
+    $('#f-models').value = (p.models || []).join(', '); $('#f-test').value = p.testModel || '';
+    $('#f-keys').value = (p.keys || []).map(k => k.key).join('\n');
+  } else {
+    $('#editor-title').textContent = '添加平台';
+    ['f-name', 'f-url', 'f-models', 'f-test', 'f-keys'].forEach(id => $('#' + id).value = '');
+    $('#f-proto').value = 'openai';
+  }
+  $('#editor').classList.add('open');
+  $('#editor').scrollIntoView({ behavior: 'smooth' });
+}
+$('#btn-add').onclick = () => openEditor(null);
+$('#btn-cancel').onclick = () => $('#editor').classList.remove('open');
+$('#btn-save-platform').onclick = async () => {
+  try {
+    await api('/platform/save', {
+      id: editId, name: $('#f-name').value.trim(), baseUrl: $('#f-url').value.trim(),
+      protocol: $('#f-proto').value, modelsText: $('#f-models').value, testModel: $('#f-test').value, keysText: $('#f-keys').value,
+    });
+    $('#editor').classList.remove('open');
+    refresh();
+  } catch (e) { $('#editor-msg').textContent = '保存失败：' + e.message; }
+};
+$('#btn-settings').onclick = async () => { try { await api('/settings', { proxyKey: $('#pk').value }); alert('已保存，proxyKey 即时生效'); } catch (e) { alert(e.message); } };
+
+async function refresh() { try { state = await api('/state'); render(); } catch (e) { console.warn(e); } }
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>
