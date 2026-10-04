@@ -7,9 +7,11 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const C = require('./convert');
+const PF = require('./proxyFetch');
 
 const ROOT = __dirname;
-const CFG_PATH = path.join(ROOT, 'config.json');
+// RELAY_CONFIG：自定义配置文件路径（测试用），默认同目录 config.json
+const CFG_PATH = process.env.RELAY_CONFIG ? path.resolve(process.env.RELAY_CONFIG) : path.join(ROOT, 'config.json');
 const INDEX_PATH = path.join(ROOT, 'public', 'index.html');
 
 const argPort = (() => { const i = process.argv.indexOf('--port'); return i >= 0 ? parseInt(process.argv[i + 1], 10) || null : null; })();
@@ -23,7 +25,7 @@ function loadConfig() {
     if (!Array.isArray(c.platforms)) c.platforms = [];
     return c;
   } catch {
-    const def = { port: 8787, host: '127.0.0.1', proxyKey: '', rateCooldownSec: 60, platforms: [] };
+    const def = { port: 8787, host: '127.0.0.1', proxyKey: '', proxyUrl: '', rateCooldownSec: 60, platforms: [] };
     try { fs.writeFileSync(CFG_PATH, JSON.stringify(def, null, 2)); } catch {}
     return def;
   }
@@ -135,6 +137,26 @@ function checkAuth(req) {
   const bearer = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
   const xk = String(req.headers['x-api-key'] || '').trim();
   return bearer === cfg.proxyKey || xk === cfg.proxyKey;
+}
+
+/* ---------------- 出站代理 ---------------- */
+// 优先级：平台代理 > 全局 proxyUrl > 环境变量（RELAY_PROXY / HTTPS_PROXY）
+// 平台填 direct 表示强制直连（即使配置了全局代理）
+function pickProxy(p) {
+  const own = String((p && p.proxy) || '').trim();
+  if (/^(direct|none|off|-)$/i.test(own)) return null;
+  let url = own || String(cfg.proxyUrl || '').trim()
+    || process.env.RELAY_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy || '';
+  url = String(url).trim();
+  if (!url || /^(direct|none|off|-)$/i.test(url)) return null; // direct 也可用于全局
+  return url;
+}
+
+// fetch 的代理感知包装：没有代理配置时行为与全局 fetch 完全一致
+function uFetch(url, opts, platform) {
+  const px = pickProxy(platform);
+  if (!px) return fetch(url, opts);
+  return PF.proxyFetch(url, opts, px);
 }
 
 /* ---------------- SSE 嗅探与管道 ---------------- */
@@ -275,7 +297,7 @@ async function handleRelay(req, res, sub) {
 
       let resp;
       try {
-        resp = await fetch(url, { method: 'POST', headers, body: bodyStr, signal: ac.signal });
+        resp = await uFetch(url, { method: 'POST', headers, body: bodyStr, signal: ac.signal }, p);
       } catch (e) {
         req.off('close', onClose);
         if (e.name === 'AbortError') return; // 客户端断开
@@ -407,7 +429,7 @@ async function handleModels(req, res) {
         const headers = proto === 'anthropic'
           ? { 'x-api-key': k.key, 'anthropic-version': '2023-06-01' }
           : { 'authorization': 'Bearer ' + k.key };
-        const r = await fetch(joinBase(p.baseUrl, '/models'), { headers, signal: AbortSignal.timeout(15000) });
+        const r = await uFetch(joinBase(p.baseUrl, '/models'), { headers, signal: AbortSignal.timeout(15000) }, p);
         if (!r.ok) continue;
         const j = await r.json();
         for (const m of (j.data || j.models || [])) if (m && m.id) out.set(String(m.id), { id: String(m.id), object: 'model', owned_by: p.name });
@@ -426,10 +448,11 @@ function stateView() {
   return {
     port: PORT,
     proxyKey: cfg.proxyKey,
+    proxyUrl: cfg.proxyUrl || '',
     rateCooldownSec: cfg.rateCooldownSec,
     platforms: cfg.platforms.map(p => ({
       id: p.id, name: p.name, baseUrl: p.baseUrl, protocol: p.protocol || 'openai',
-      models: p.models || [], testModel: p.testModel || '',
+      models: p.models || [], testModel: p.testModel || '', proxy: p.proxy || '',
       keys: (p.keys || []).map((k, i) => ({ i, mask: mask(k.key), status: keyStatus(k), lastError: k.lastError || '', lastUsed: k.lastUsed || 0, cooldownUntil: k.cooldownUntil || 0, failCount: k.failCount || 0 })),
     })),
     stats: { ok: stats.ok, fail: stats.fail, startedAt: stats.startedAt },
@@ -454,7 +477,7 @@ async function testKey(p, k) {
     bodyStr = JSON.stringify({ model, max_tokens: 4, messages: [{ role: 'user', content: 'hi' }] });
   }
   try {
-    const r = await fetch(url, { method: 'POST', headers, body: bodyStr, signal: AbortSignal.timeout(30000) });
+    const r = await uFetch(url, { method: 'POST', headers, body: bodyStr, signal: AbortSignal.timeout(30000) }, p);
     const txt = await r.text();
     if (r.ok) { markKey(p, k, 'ok', ''); return { ok: true, status: r.status, ms: Date.now() - t0, msg: '测试通过（' + model + '）' }; }
     const cls = classify(r.status, txt);
@@ -484,18 +507,22 @@ async function handleAdmin(req, res, sub) {
     const proto = protocol === 'anthropic' ? 'anthropic' : 'openai';
     const models = String(modelsText || '').split(/[\n,，]+/).map(s => s.trim()).filter(Boolean);
     const keyList = [...new Set(String(keysText || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean))];
+    const proxy = String(body.proxy || '').trim();
+    if (proxy && !/^(direct|none|off|-)$/i.test(proxy)) {
+      try { PF.parseProxy(proxy); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    }
     let p;
     if (id) {
       p = cfg.platforms.find(x => x.id === id);
       if (!p) return sendJson(res, 404, { error: '平台不存在' });
-      Object.assign(p, { name: String(name).trim(), baseUrl: String(baseUrl).trim(), protocol: proto, models, testModel: String(testModel || '').trim() });
+      Object.assign(p, { name: String(name).trim(), baseUrl: String(baseUrl).trim(), protocol: proto, models, testModel: String(testModel || '').trim(), proxy });
       const old = new Map((p.keys || []).map(k => [k.key, k]));
       p.keys = keyList.map(kk => old.get(kk) || newKey(kk));
     } else {
       p = {
         id: 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
         name: String(name).trim(), baseUrl: String(baseUrl).trim(), protocol: proto,
-        models, testModel: String(testModel || '').trim(), keys: keyList.map(newKey),
+        models, testModel: String(testModel || '').trim(), proxy, keys: keyList.map(newKey),
       };
       cfg.platforms.push(p);
     }
@@ -530,9 +557,14 @@ async function handleAdmin(req, res, sub) {
 
   if (req.method === 'POST' && sub === '/settings') {
     if (typeof body.proxyKey === 'string') cfg.proxyKey = body.proxyKey.trim();
+    if (typeof body.proxyUrl === 'string') {
+      const v = body.proxyUrl.trim();
+      try { if (v && !/^(direct|none|off|-)$/i.test(v)) PF.parseProxy(v); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+      cfg.proxyUrl = v;
+    }
     if (Number.isFinite(body.rateCooldownSec)) cfg.rateCooldownSec = Math.max(5, body.rateCooldownSec);
     save();
-    return sendJson(res, 200, { ok: true, note: 'proxyKey 即时生效；修改端口请编辑 config.json 后重启' });
+    return sendJson(res, 200, { ok: true, note: 'proxyKey / 代理即时生效；修改端口请编辑 config.json 后重启' });
   }
 
   sendJson(res, 404, { error: '未知管理接口 ' + sub });
@@ -576,12 +608,13 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   const nk = cfg.platforms.reduce((n, p) => n + (p.keys || []).length, 0);
+  const px = String(cfg.proxyUrl || '').trim();
   console.log('');
   console.log('  LLM Key 中转池 已启动');
   console.log('  管理页       http://localhost:' + PORT + '/');
   console.log('  OpenAI 端点  http://localhost:' + PORT + '/v1   （base_url 填这个）');
   console.log('  Claude 端点  http://localhost:' + PORT + '       （ANTHROPIC_BASE_URL 填这个）');
-  console.log('  当前 ' + cfg.platforms.length + ' 个平台 / ' + nk + ' 个 key');
+  console.log('  当前 ' + cfg.platforms.length + ' 个平台 / ' + nk + ' 个 key' + (px ? ' / 全局出站代理 ' + px : ''));
   console.log('');
 });
 server.on('error', e => { console.error('[!] 服务启动失败:', e.message); process.exit(1); });

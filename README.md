@@ -53,6 +53,15 @@ start.bat        （或手动：node server.js）
 上游协议与客户端协议不同时自动转换（如 Claude Code → OpenAI 上游、OpenAI 客户端 → Anthropic 上游），
 支持文本、推理内容（reasoning↔thinking）、工具调用（含流式增量参数）。
 
+## 出站代理
+
+需要经代理访问上游平台时（如直连不通的官方 API），零依赖支持 `http` / `https` / `socks5` / `socks5h`
+（socks5 本地解析域名，socks5h 由代理解析），账号密码写在 URL 里：`socks5://user:pass@host:port`。
+
+- **全局代理**：管理页顶部「全局出站代理」，或 config.json 的 `proxyUrl`，或环境变量 `RELAY_PROXY` / `HTTPS_PROXY`。
+- **平台级代理**：平台编辑框里的「上游代理」，留空 = 跟随全局，填 `direct` = 强制直连。
+- 流式/非流式、模型列表、key 测试都走代理；管理页本身不受影响。改完即时生效，无需重启。
+
 ## 安全
 
 - 默认只监听 `127.0.0.1`，局域网访问不到。
@@ -65,4 +74,6 @@ start.bat        （或手动：node server.js）
 node tests/mock.js          # 起两个 mock 上游（9101 OpenAI 协议 / 9102 Anthropic 协议）
 node server.js --port 8790  # 再起一个中转实例
 # 然后在管理页添加指向 127.0.0.1:9101/9102 的平台即可验证轮换与转换
+
+node tests/proxy.test.js    # 一键自测出站代理：脚本内自建 mock 上游 + HTTP 代理 + SOCKS5 代理
 ```

@@ -55,6 +55,7 @@
       <div class="sub" id="sub">加载中…</div>
     </div>
     <div class="row">
+      <input id="proxy" placeholder="全局出站代理（可留空）" style="width:260px" title="支持 http:// https:// socks5:// socks5h://，账号密码写 user:pass@host:port；对未单独设代理的平台生效">
       <input id="pk" placeholder="proxyKey（客户端访问密钥，可留空）" style="width:250px">
       <button id="btn-settings" class="primary">保存设置</button>
       <button id="btn-add">＋ 添加平台</button>
@@ -77,6 +78,7 @@
     <div class="row" style="margin-top:2px">
       <div style="flex:2;min-width:260px"><label class="f">限定模型（逗号分隔，留空 = 兜底接住所有模型）</label><input id="f-models" class="iw" placeholder="gpt-4o, gpt-4o-mini"></div>
       <div style="flex:1;min-width:150px"><label class="f">测试用模型（可选）</label><input id="f-test" class="iw" placeholder="默认取第一个限定模型"></div>
+      <div style="flex:2;min-width:240px"><label class="f">上游代理（留空 = 跟随全局，direct = 强制直连）</label><input id="f-proxy" class="iw" placeholder="http://127.0.0.1:7890 或 socks5://user:pass@host:1080"></div>
     </div>
     <label class="f">API Keys —— 一行一个，可整段粘贴（自动去重；已存在的 key 保留状态）</label>
     <textarea id="f-keys" placeholder="sk-xxxx&#10;sk-yyyy&#10;sk-zzzz"></textarea>
@@ -112,6 +114,13 @@ async function api(path, body, method) {
   return j;
 }
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+// 设置类输入框防轮询覆盖：正在聚焦编辑或有未保存修改时跳过，避免输入到一半被 4 秒轮询清空
+function setInput(sel, v) {
+  const el = $(sel);
+  if (el === document.activeElement || el.dataset.dirty) return;
+  el.value = v;
+}
+['#pk', '#proxy'].forEach(sel => $(sel).addEventListener('input', e => { e.target.dataset.dirty = '1'; }));
 function ago(t) { if (!t) return '—'; const s = (Date.now() - t) / 1000 | 0; if (s < 60) return s + '秒前'; if (s < 3600) return (s / 60 | 0) + '分钟前'; if (s < 86400) return (s / 3600 | 0) + '小时前'; return (s / 86400 | 0) + '天前'; }
 const CHIP = { alive: '可用', cooldown: '冷却中', exhausted: '无余额', invalid: '无效', disabled: '已停用' };
 
@@ -120,7 +129,8 @@ function render() {
   $('#sub').textContent = 'http://localhost:' + state.port + ' · ' + state.platforms.length + ' 个平台 · ' + nk + ' 个 key';
   $('#h-openai').textContent = 'http://localhost:' + state.port + '/v1';
   $('#h-claude').textContent = 'http://localhost:' + state.port;
-  $('#pk').value = state.proxyKey || '';
+  setInput('#pk', state.proxyKey || '');
+  setInput('#proxy', state.proxyUrl || '');
   $('#stat').textContent = '成功 ' + state.stats.ok + ' / 失败 ' + state.stats.fail;
   $('#platforms').innerHTML = state.platforms.map(platformCard).join('') || '<div class="card sub">还没有平台，点右上角「＋ 添加平台」</div>';
   $('#log tbody').innerHTML = (state.log || []).slice(0, 50).map(r =>
@@ -138,7 +148,8 @@ function platformCard(p) {
     + ' <span class="badge ' + p.protocol + '">' + (p.protocol === 'anthropic' ? 'Anthropic 协议' : 'OpenAI 协议') + '</span>'
     + ' <span class="sub">' + cntStr + '</span><span style="flex:1"></span>'
     + '<button data-act="edit">编辑</button><button data-act="reset">重置失效</button><button data-act="del" class="danger">删除</button></h3>'
-    + '<div class="url">' + esc(p.baseUrl) + '</div>'
+    + '<div class="url">' + esc(p.baseUrl)
+    + (p.proxy ? '　·　代理 <span style="color:var(--acc)">' + esc(p.proxy) + '</span>' : '') + '</div>'
     + '<div style="margin-top:6px">' + (p.models.length ? p.models.map(m => '<span class="mdl">' + esc(m) + '</span>').join('') : '<span class="sub">未限定模型（兜底接住所有模型）</span>') + '</div>'
     + '<table><thead><tr><th>Key</th><th>状态</th><th>最近错误</th><th>最近使用</th><th style="width:150px">操作</th></tr></thead><tbody>'
     + (p.keys.length ? p.keys.map(k =>
@@ -184,10 +195,11 @@ async function openEditor(pid) {
     $('#editor-title').textContent = '编辑平台：' + p.name;
     $('#f-name').value = p.name; $('#f-url').value = p.baseUrl; $('#f-proto').value = p.protocol;
     $('#f-models').value = (p.models || []).join(', '); $('#f-test').value = p.testModel || '';
+    $('#f-proxy').value = p.proxy || '';
     $('#f-keys').value = (p.keys || []).map(k => k.key).join('\n');
   } else {
     $('#editor-title').textContent = '添加平台';
-    ['f-name', 'f-url', 'f-models', 'f-test', 'f-keys'].forEach(id => $('#' + id).value = '');
+    ['f-name', 'f-url', 'f-models', 'f-test', 'f-proxy', 'f-keys'].forEach(id => $('#' + id).value = '');
     $('#f-proto').value = 'openai';
   }
   $('#editor').classList.add('open');
@@ -199,13 +211,20 @@ $('#btn-save-platform').onclick = async () => {
   try {
     await api('/platform/save', {
       id: editId, name: $('#f-name').value.trim(), baseUrl: $('#f-url').value.trim(),
-      protocol: $('#f-proto').value, modelsText: $('#f-models').value, testModel: $('#f-test').value, keysText: $('#f-keys').value,
+      protocol: $('#f-proto').value, modelsText: $('#f-models').value, testModel: $('#f-test').value,
+      proxy: $('#f-proxy').value.trim(), keysText: $('#f-keys').value,
     });
     $('#editor').classList.remove('open');
     refresh();
   } catch (e) { $('#editor-msg').textContent = '保存失败：' + e.message; }
 };
-$('#btn-settings').onclick = async () => { try { await api('/settings', { proxyKey: $('#pk').value }); alert('已保存，proxyKey 即时生效'); } catch (e) { alert(e.message); } };
+$('#btn-settings').onclick = async () => {
+  try {
+    await api('/settings', { proxyKey: $('#pk').value, proxyUrl: $('#proxy').value });
+    ['#pk', '#proxy'].forEach(sel => $(sel).dataset.dirty = '');
+    alert('已保存，proxyKey / 代理即时生效');
+  } catch (e) { alert(e.message); }
+};
 
 async function refresh() { try { state = await api('/state'); render(); } catch (e) { console.warn(e); } }
 refresh();
