@@ -48,6 +48,8 @@ function attemptLog(model, platform, keyMask, ok, ms, msg) {
 /* ---------------- 错误归类 ---------------- */
 const EXHAUST_RE = /INSUFFICIENT_BALANCE|insufficient_quota|insufficient balance|quota[^\n]{0,24}(exceed|exhaust|used up|finish)|exceeded your current quota|余额不足|余额(已)?(用完|用尽|耗尽|不足)|欠费|无余额|balance[^\n]{0,16}(insufficient|exhausted|depleted|not enough|used up)|no (enough )?balance|arrears|配额(已)?(用完|用尽|耗尽)/i;
 const INVALID_RE = /invalid[_ ]?api[_ ]?key|invalid\s*(api[- ]?key|x-api-key|token)|incorrect api key|api key[^\n]{0,20}(invalid|not valid|expired)|(令牌|密钥|token|key)[^\n]{0,6}无效|无效[^\n]{0,4}(令牌|密钥|token|key)|unauthorized|authentication|鉴权失败|未授权/i;
+// 账号级永久问题（冻结/封禁/停用）：key 已废，等同无效，换下一个 key 重试
+const FROZEN_RE = /冻结|封禁|封停|已停机|(账号|帐号|账户|计费账户|令牌|密钥|token)[^\n]{0,6}(被)?(禁用|停用)|(banned|suspended|deactivated)|account[^\n]{0,16}(frozen|disabled|blocked|suspended)/i;
 const RATE_RE = /rate[- ]?limit|too many requests|请求过于频繁|限流|请求速度|throttl|并发过高/i;
 const NEXT_PLAT_RE = /MODEL_NOT_AVAILABLE|model[^\n]{0,30}(not found|not available|does not exist)|模型不存在|模型不可用|不支持该协议|无可用渠道|no available channel|not supported/i;
 
@@ -61,6 +63,7 @@ function classify(status, text) {
     msg = String((j.error && j.error.message) || j.message || msg).slice(0, 300);
   } catch {}
   if (EXHAUST_RE.test(hay) || status === 402) return { type: 'exhausted', msg };
+  if (FROZEN_RE.test(hay)) return { type: 'invalid', msg };
   if (status === 401 || status === 403 || INVALID_RE.test(hay)) return { type: 'invalid', msg };
   if (status === 429 || RATE_RE.test(hay)) return { type: 'rate', msg };
   if (status >= 500 || status === 408 || !status) return { type: 'transient', msg };
