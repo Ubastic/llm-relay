@@ -1,5 +1,6 @@
 # 含明文 API key 与运行时状态（key 池状态/统计），切勿提交；缺失时 server.js 会自动生成默认配置
 config.json
+config-*.json
 
 node_modules/
 *.log
