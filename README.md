@@ -27,19 +27,26 @@ start.bat        （或手动：node server.js）
 
 ## key 轮换规则
 
-请求失败时按类型自动处理并换下一个 key（跨平台继续重试，最多 10 次）：
+请求失败时按类型自动处理并换下一个 key（跨平台继续重试，预算为「10 次 / alive key 总数」的较大者）：
 
 | 错误类型 | 识别方式 | 处理 |
 |---|---|---|
 | 无余额 | HTTP 402 / `INSUFFICIENT_BALANCE` / `insufficient_quota` / `余额不足` 等 | key 永久剔除（管理页可一键恢复） |
 | 无效 key | 401/403 / `invalid api key` / `令牌无效` 等 | key 永久剔除 |
 | 账号冻结/封禁 | `计费账户已被冻结` / `封禁` / `停用` 等（即便返回 400） | 按 key 级永久问题处理：标记无效并换下一个 key，不会反复撞这把 key |
-| 限流 | 429 / `rate limit` 等 | 该 key 冷却 60 秒（`rateCooldownSec` 可调） |
+| 限流 | 429 / `rate limit` 等 | 该 key 冷却 60 秒（`rateCooldownSec` 可调），冷却时长带 ±25% 抖动 |
 | 网络/5xx | 超时、连接失败 | 连续 3 次失败后冷却 2 分钟 |
+| 单次尝试超时 | 上游连上但 `attemptTimeoutSec`（默认 90s）内不返回响应头 | 按 transient 处理换下一个 key |
 | 模型不存在 / 400 | `MODEL_NOT_AVAILABLE`、参数错误等 | 不换 key；模型不存在则换下一个平台，参数错误原样返回给客户端 |
 
 规则匹配的是响应文本，各家中转站格式不一也能兜住；实测 tokenrhythm 返回
 `HTTP 402 {"code":"INSUFFICIENT_BALANCE","message":"余额不足"}` 会被正确剔除。
+
+### 并发分摊（LRU 选 key）
+
+key 不再按配置顺序使用，而是**最久未用优先**，且派发即更新占用时间——并发请求会
+自动分摊到不同 key 上，避免所有在途请求压同一把 key 触发同步限流/冷却级联。
+多客户端并发（如多线程回测）场景直接受益；冷却抖动避免多把 key 同时到期后再同步相撞。
 
 ## 端点
 

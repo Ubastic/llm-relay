@@ -88,17 +88,23 @@ function keyStatus(k) {
   return 'alive';
 }
 function aliveKeys(p) { return (p.keys || []).filter(k => k.status === 'alive' && (k.cooldownUntil || 0) <= Date.now()); }
+// LRU 选 key：按“最久未用优先”排序。并发请求会自然分摊到不同 key，
+// 避免所有在途请求压在数组里第一把 key 上（惊群 → 同步限流 → 冷却级联）。
+function orderedKeys(p) { return aliveKeys(p).slice().sort((a, b) => (a.lastUsed || 0) - (b.lastUsed || 0)); }
 function markKey(p, k, type, msg) {
   if (type === 'ok') { k.status = 'alive'; k.lastUsed = Date.now(); k.lastError = ''; k.failCount = 0; k.cooldownUntil = 0; }
   else if (type === 'exhausted') { k.status = 'exhausted'; k.lastError = '[无余额] ' + msg; }
   else if (type === 'invalid') { k.status = 'invalid'; k.lastError = '[无效] ' + msg; }
-  else if (type === 'rate') { k.cooldownUntil = Date.now() + (cfg.rateCooldownSec || 60) * 1000; k.lastError = '[限流] ' + msg; }
+  else if (type === 'rate') { k.cooldownUntil = coolAt((cfg.rateCooldownSec || 60) * 1000); k.lastError = '[限流] ' + msg; }
   else if (type === 'transient') {
     k.failCount = (k.failCount || 0) + 1; k.lastError = msg;
-    if (k.failCount >= 3) { k.cooldownUntil = Date.now() + 120000; k.lastError = '[连续失败' + 3 + '次，冷却2分钟] ' + msg; k.failCount = 0; }
+    if (k.failCount >= 3) { k.cooldownUntil = coolAt(120000); k.lastError = '[连续失败' + 3 + '次，冷却2分钟] ' + msg; k.failCount = 0; }
   } else return; // next_platform 等不动 key 状态
   save();
 }
+// 冷却时长加 ±25% 抖动：并发失败波会把多把 key 同时打进冷却，不加抖动会同时到期、
+// 下一波继续同步撞同一批 key
+function coolAt(ms) { return Date.now() + Math.round(ms * (0.75 + Math.random() * 0.5)); }
 
 /* ---------------- 工具 ---------------- */
 function joinBase(base, sub) {
@@ -298,18 +304,22 @@ async function handleRelay(req, res, sub) {
 
   const tried = [];
   let attempts = 0, sawRate = false;
-  const MAX_ATTEMPTS = 10;
+  // 预算放宽到“alive key 总数”：冷却风暴期部分 key 不可用时，
+  // 固定 10 次可能在摸到新鲜 key 之前就耗尽
+  const MAX_ATTEMPTS = Math.max(10, plan.reduce((n, p) => n + aliveKeys(p).length, 0));
 
   for (const p of plan) {
     const proto = p.protocol === 'anthropic' ? 'anthropic' : 'openai';
     if (isCount && proto !== 'anthropic') continue; // count_tokens 只转发 anthropic 上游，其余走兜底估算
     if (passthroughOnly && proto !== 'openai') continue;
 
-    for (const k of aliveKeys(p)) {
+    for (const k of orderedKeys(p)) {
       if (attempts >= MAX_ATTEMPTS) break;
       attempts++;
       const t0 = Date.now();
       const km = mask(k.key);
+      // 派发即占用：同一毫秒到达的并发请求选到不同 key（LRU 排序随即错开）
+      k.lastUsed = Date.now();
 
       let url, headers, bodyStr;
       if (proto === 'anthropic') {
@@ -327,13 +337,28 @@ async function handleRelay(req, res, sub) {
       const ac = new AbortController();
       const onClose = () => ac.abort();
       req.on('close', onClose);
+      // 单次尝试超时：部分上游“连接活着但不吐数据”，TTFB 可无限挂起（实测 >10 分钟），
+      // 且会占满客户端等待。到点中止并按 transient 换下一把 key。
+      const attemptSec = cfg.attemptTimeoutSec || 90;
+      let attemptTimedOut = false;
+      const attemptTimer = setTimeout(() => { attemptTimedOut = true; ac.abort(); }, attemptSec * 1000);
 
       let resp;
       try {
         resp = await uFetch(url, { method: 'POST', headers, body: bodyStr, signal: ac.signal }, p);
+        clearTimeout(attemptTimer);
       } catch (e) {
         req.off('close', onClose);
-        if (e.name === 'AbortError') return; // 客户端断开
+        clearTimeout(attemptTimer);
+        if (e.name === 'AbortError') {
+          if (attemptTimedOut) {
+            markKey(p, k, 'transient', '单次尝试超时（' + attemptSec + 's，无响应头）');
+            tried.push(p.name + '[' + km + '] 尝试超时: ' + attemptSec + 's 无响应头');
+            attemptLog(model, p.name, km, false, Date.now() - t0, '尝试超时');
+            continue;
+          }
+          return; // 客户端断开
+        }
         markKey(p, k, 'transient', '网络错误: ' + e.message);
         tried.push(p.name + '[' + km + '] 网络错误: ' + e.message);
         attemptLog(model, p.name, km, false, Date.now() - t0, '网络错误');
