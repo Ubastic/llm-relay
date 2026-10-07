@@ -33,6 +33,7 @@ start.bat        （或手动：node server.js）
 |---|---|---|
 | 无余额 | HTTP 402 / `INSUFFICIENT_BALANCE` / `insufficient_quota` / `余额不足` 等 | key 永久剔除（管理页可一键恢复） |
 | 无效 key | 401/403 / `invalid api key` / `令牌无效` 等 | key 永久剔除 |
+| 账号冻结/封禁 | `计费账户已被冻结` / `封禁` / `停用` 等（即便返回 400） | 按 key 级永久问题处理：标记无效并换下一个 key，不会反复撞这把 key |
 | 限流 | 429 / `rate limit` 等 | 该 key 冷却 60 秒（`rateCooldownSec` 可调） |
 | 网络/5xx | 超时、连接失败 | 连续 3 次失败后冷却 2 分钟 |
 | 模型不存在 / 400 | `MODEL_NOT_AVAILABLE`、参数错误等 | 不换 key；模型不存在则换下一个平台，参数错误原样返回给客户端 |
@@ -51,7 +52,8 @@ start.bat        （或手动：node server.js）
 | `GET /v1/models` | 聚合所有平台的模型列表（缓存 60 秒） |
 
 上游协议与客户端协议不同时自动转换（如 Claude Code → OpenAI 上游、OpenAI 客户端 → Anthropic 上游），
-支持文本、推理内容（reasoning↔thinking）、工具调用（含流式增量参数）。
+支持文本、推理内容（reasoning_content↔thinking）、工具调用（含流式增量参数）；
+同协议直通路径对 reasoning_content 等扩展字段一律原样透传，流式与非流式行为一致。
 
 ## 出站代理
 
@@ -76,4 +78,6 @@ node server.js --port 8790  # 再起一个中转实例
 # 然后在管理页添加指向 127.0.0.1:9101/9102 的平台即可验证轮换与转换
 
 node tests/proxy.test.js    # 一键自测出站代理：脚本内自建 mock 上游 + HTTP 代理 + SOCKS5 代理
+node tests/reasoning.test.js # 一键自测推理内容透传：reasoning_content/thinking 在流式与非流式、跨协议转换下均不丢失
+node tests/frozen.test.js   # 一键自测账号冻结类错误：key 自动剔除并换下一个，不透传给客户端
 ```
