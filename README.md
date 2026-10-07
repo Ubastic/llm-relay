@@ -64,6 +64,11 @@ start.bat        （或手动：node server.js）
 - **平台级代理**：平台编辑框里的「上游代理」，留空 = 跟随全局，填 `direct` = 强制直连。
 - 流式/非流式、模型列表、key 测试都走代理；管理页本身不受影响。改完即时生效，无需重启。
 
+## 配置备份与密码保护
+
+- **导出/导入**：管理页右上角「导出配置 / 导入配置」。导出为完整 JSON（平台、key、代理、proxyKey 等，**内含明文 key，注意保管**）；导入会覆盖当前全部设置与平台，key 的状态（无效/停用等）一并恢复。
+- **管理页密码**：设置环境变量 `RELAY_ADMIN_PASSWORD`（或 `ADMIN_PASSWORD`）后，打开管理页需先输入密码登录（Cookie 保持 30 天，重启不失效）；不设置则维持原样直接访问。中转端点 `/v1/*` 不受影响，仍由 proxyKey 控制；脚本调用管理接口仍可用 `x-admin-key`。
+
 ## 安全
 
 - 默认只监听 `127.0.0.1`，局域网访问不到。
@@ -80,4 +85,5 @@ node server.js --port 8790  # 再起一个中转实例
 node tests/proxy.test.js    # 一键自测出站代理：脚本内自建 mock 上游 + HTTP 代理 + SOCKS5 代理
 node tests/reasoning.test.js # 一键自测推理内容透传：reasoning_content/thinking 在流式与非流式、跨协议转换下均不丢失
 node tests/frozen.test.js   # 一键自测账号冻结类错误：key 自动剔除并换下一个，不透传给客户端
+node tests/admin.test.js    # 一键自测配置导出/导入与管理页密码保护
 ```

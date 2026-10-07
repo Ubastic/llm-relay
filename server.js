@@ -6,6 +6,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const C = require('./convert');
 const PF = require('./proxyFetch');
 
@@ -16,6 +17,9 @@ const INDEX_PATH = path.join(ROOT, 'public', 'index.html');
 
 const argPort = (() => { const i = process.argv.indexOf('--port'); return i >= 0 ? parseInt(process.argv[i + 1], 10) || null : null; })();
 const envPort = parseInt(process.env.RELAY_PORT, 10) || null;
+// RELAY_ADMIN_PASSWORD（或 ADMIN_PASSWORD）：设置后管理页需先用密码登录（Cookie 保持 30 天）；
+// 不设置则和以前一样直接访问。中转端点 /v1/* 不受影响，仍由 proxyKey 控制。
+const ADMIN_PASSWORD = process.env.RELAY_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || '';
 
 /* ---------------- 配置 ---------------- */
 let cfg = loadConfig();
@@ -140,6 +144,32 @@ function checkAuth(req) {
   const bearer = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
   const xk = String(req.headers['x-api-key'] || '').trim();
   return bearer === cfg.proxyKey || xk === cfg.proxyKey;
+}
+
+/* ---------------- 管理页密码保护 ---------------- */
+function parseCookies(req) {
+  const out = {};
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+// 登录凭证：过期时间戳 + 以密码为密钥的 HMAC，不存会话、重启后仍有效
+function authSign(exp) { return crypto.createHmac('sha256', ADMIN_PASSWORD).update('relay-auth-' + exp).digest('hex'); }
+function makeAuthToken() { const exp = Date.now() + 30 * 86400000; return exp + '.' + authSign(exp); }
+function checkAuthToken(t) {
+  const i = String(t || '').indexOf('.');
+  if (i <= 0) return false;
+  const exp = t.slice(0, i), sig = t.slice(i + 1);
+  if (!/^\d+$/.test(exp) || Number(exp) < Date.now()) return false;
+  const expect = authSign(exp);
+  return sig.length === expect.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expect));
+}
+// 管理接口鉴权：开了密码门则有效登录 Cookie 直接放行；否则沿用 proxyKey（两者兼容，脚本仍可用 x-admin-key）
+function adminAuthed(req) {
+  if (ADMIN_PASSWORD && checkAuthToken(parseCookies(req).relay_auth)) return true;
+  return !cfg.proxyKey || String(req.headers['x-admin-key'] || '') === cfg.proxyKey;
 }
 
 /* ---------------- 出站代理 ---------------- */
@@ -465,6 +495,14 @@ function stateView() {
 
 function newKey(kk) { return { key: kk, status: 'alive', lastError: '', lastUsed: 0, failCount: 0, cooldownUntil: 0 }; }
 
+// 导入配置时的 key 归一化：字符串或完整对象都接受，非法状态回落 alive
+function normKey(raw) {
+  if (typeof raw === 'string') return raw.trim() ? newKey(raw.trim()) : null;
+  if (!raw || typeof raw.key !== 'string' || !raw.key.trim()) return null;
+  const st = ['alive', 'disabled', 'exhausted', 'invalid'].includes(raw.status) ? raw.status : 'alive';
+  return { key: raw.key.trim(), status: st, lastError: String(raw.lastError || ''), lastUsed: Number(raw.lastUsed) || 0, failCount: Number(raw.failCount) || 0, cooldownUntil: Number(raw.cooldownUntil) || 0 };
+}
+
 async function testKey(p, k) {
   const proto = p.protocol === 'anthropic' ? 'anthropic' : 'openai';
   const model = p.testModel || (p.models || [])[0] || 'glm-5.3-flash';
@@ -492,10 +530,58 @@ async function testKey(p, k) {
 }
 
 async function handleAdmin(req, res, sub) {
-  if (cfg.proxyKey && String(req.headers['x-admin-key'] || '') !== cfg.proxyKey) return sendJson(res, 401, { error: '需要访问密钥（proxyKey）' });
   const body = await readBody(req).then(b => { try { return JSON.parse(b.toString('utf8') || '{}'); } catch { return {}; } }).catch(() => ({}));
 
+  // 登录：无需已有凭证；密码错误延迟返回，拖慢爆破
+  if (req.method === 'POST' && sub === '/login') {
+    if (!ADMIN_PASSWORD) return sendJson(res, 400, { error: '未开启密码保护（设置环境变量 RELAY_ADMIN_PASSWORD）' });
+    const pw = String(body.password || '');
+    const same = pw.length === ADMIN_PASSWORD.length && crypto.timingSafeEqual(Buffer.from(pw), Buffer.from(ADMIN_PASSWORD));
+    if (!same) {
+      await new Promise(r => setTimeout(r, 800));
+      return sendJson(res, 401, { error: '密码错误' });
+    }
+    res.setHeader('set-cookie', 'relay_auth=' + makeAuthToken() + '; Path=/; HttpOnly; Max-Age=' + 30 * 86400 + '; SameSite=Strict');
+    return sendJson(res, 200, { ok: true });
+  }
+
+  if (!adminAuthed(req)) return sendJson(res, 401, { error: ADMIN_PASSWORD ? '需要登录或访问密钥（proxyKey）' : '需要访问密钥（proxyKey）' });
+
   if (req.method === 'GET' && sub === '/state') return sendJson(res, 200, stateView());
+
+  if (req.method === 'GET' && sub === '/config/export') {
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-disposition': 'attachment; filename="llm-relay-config.json"',
+    });
+    return res.end(JSON.stringify(cfg, null, 2));
+  }
+
+  if (req.method === 'POST' && sub === '/config/import') {
+    const c = body && typeof body === 'object' ? (body.config && typeof body.config === 'object' ? body.config : body) : null;
+    if (!c || !Array.isArray(c.platforms)) return sendJson(res, 400, { error: '配置格式不对：缺少 platforms 数组' });
+    const plats = [], seen = new Set();
+    for (const raw of c.platforms) {
+      if (!raw || !String(raw.name || '').trim() || !String(raw.baseUrl || '').trim())
+        return sendJson(res, 400, { error: '存在缺少名称或 Base URL 的平台，导入已取消' });
+      let id = String(raw.id || '').trim();
+      if (!id || seen.has(id)) id = 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      seen.add(id);
+      const keys = (Array.isArray(raw.keys) ? raw.keys : []).map(normKey).filter(Boolean);
+      plats.push({
+        id, name: String(raw.name).trim(), baseUrl: String(raw.baseUrl).trim(),
+        protocol: raw.protocol === 'anthropic' ? 'anthropic' : 'openai',
+        models: Array.isArray(raw.models) ? raw.models.map(String).filter(Boolean) : [],
+        testModel: String(raw.testModel || '').trim(), proxy: String(raw.proxy || '').trim(), keys,
+      });
+    }
+    if (typeof c.proxyKey === 'string') cfg.proxyKey = c.proxyKey.trim();
+    if (typeof c.proxyUrl === 'string') cfg.proxyUrl = c.proxyUrl.trim();
+    if (Number.isFinite(c.rateCooldownSec)) cfg.rateCooldownSec = Math.max(5, c.rateCooldownSec);
+    cfg.platforms = plats;
+    save(); modelsCache = { at: 0, data: null };
+    return sendJson(res, 200, { ok: true, platforms: plats.length, keys: plats.reduce((n, p) => n + p.keys.length, 0) });
+  }
 
   if (req.method === 'GET' && sub === '/platform') {
     const id = new URL(req.url, 'http://x').searchParams.get('id');
@@ -577,7 +663,55 @@ async function handleAdmin(req, res, sub) {
 const PORT = argPort || envPort || cfg.port || 8787;
 const HOST = cfg.host || '127.0.0.1';
 
-function serveIndex(res) {
+const LOGIN_HTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 - LLM Key 中转池</title>
+<style>
+  :root { --bg:#0e1116; --card:#161b23; --line:#263041; --txt:#dbe4f0; --dim:#8494ab; --acc:#4f8cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:14px/1.6 system-ui,"Segoe UI","Microsoft YaHei",sans-serif; display:flex; align-items:center; justify-content:center; min-height:100vh; }
+  .box { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:34px 38px; width:320px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:var(--dim); font-size:13px; margin:0 0 18px; }
+  input { width:100%; background:#0a0d12; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:9px 11px; font-size:14px; }
+  input:focus { outline:none; border-color:var(--acc); }
+  button { width:100%; margin-top:12px; background:var(--acc); border:1px solid var(--acc); color:#fff; border-radius:8px; padding:9px; cursor:pointer; font-size:14px; }
+  #msg { color:#ef7b7b; font-size:13px; min-height:20px; margin-top:10px; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>🔑 LLM Key 中转池</h1>
+  <p class="sub">本管理页已开启密码保护，请输入访问密码</p>
+  <input type="password" id="pw" placeholder="访问密码" autofocus>
+  <button id="go">登 录</button>
+  <div id="msg"></div>
+</div>
+<script>
+async function go() {
+  const msg = document.querySelector('#msg');
+  msg.textContent = '';
+  try {
+    const r = await fetch('/admin/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: document.querySelector('#pw').value }) });
+    if (r.ok) { location.href = '/'; return; }
+    const j = await r.json().catch(() => ({}));
+    msg.textContent = j.error || '密码错误';
+  } catch (e) { msg.textContent = '网络错误：' + e.message; }
+}
+document.querySelector('#go').onclick = go;
+document.querySelector('#pw').addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+</script>
+</body>
+</html>`;
+
+function serveIndex(req, res) {
+  if (ADMIN_PASSWORD && !checkAuthToken(parseCookies(req).relay_auth)) {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    return res.end(LOGIN_HTML);
+  }
   fs.readFile(INDEX_PATH, (e, buf) => {
     if (e) { res.writeHead(500); return res.end('public/index.html 缺失'); }
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
@@ -591,7 +725,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, 'http://x');
     const p = decodeURIComponent(u.pathname);
-    if (p === '/' || p === '/index.html') return serveIndex(res);
+    if (p === '/' || p === '/index.html') return serveIndex(req, res);
     if (p === '/favicon.ico') { res.writeHead(204); return res.end(); }
     if (p.startsWith('/admin/api/')) return await handleAdmin(req, res, p.slice('/admin/api'.length));
 

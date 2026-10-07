@@ -59,6 +59,9 @@
       <input id="pk" placeholder="proxyKey（客户端访问密钥，可留空）" style="width:250px">
       <button id="btn-settings" class="primary">保存设置</button>
       <button id="btn-add">＋ 添加平台</button>
+      <button id="btn-export" title="把全部平台、key 与设置导出为 JSON 文件（内含明文 key，注意保管）">导出配置</button>
+      <button id="btn-import" title="从导出的 JSON 文件恢复，覆盖当前全部设置与平台">导入配置</button>
+      <input type="file" id="import-file" accept=".json,application/json" style="display:none">
     </div>
   </div>
 
@@ -224,6 +227,35 @@ $('#btn-settings').onclick = async () => {
     ['#pk', '#proxy'].forEach(sel => $(sel).dataset.dirty = '');
     alert('已保存，proxyKey / 代理即时生效');
   } catch (e) { alert(e.message); }
+};
+
+$('#btn-export').onclick = async () => {
+  try {
+    const data = await api('/config/export');
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    const d = new Date(), pad = n => String(n).padStart(2, '0');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'llm-relay-config-' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + '.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  } catch (e) { alert('导出失败：' + e.message); }
+};
+$('#btn-import').onclick = () => $('#import-file').click();
+$('#import-file').onchange = async e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  try {
+    const cfgIn = JSON.parse(await f.text());
+    const n = (cfgIn.platforms || []).length;
+    if (!Array.isArray(cfgIn.platforms)) return alert('导入失败：文件里没有 platforms 数组，不是本工具导出的配置');
+    if (!confirm('导入将覆盖当前全部设置与平台（文件里有 ' + n + ' 个平台），继续？')) return;
+    const r = await api('/config/import', cfgIn);
+    alert('导入成功：' + r.platforms + ' 个平台 / ' + r.keys + ' 个 key'
+      + (cfgIn.proxyKey ? '\n注意：导入的配置带 proxyKey，之后访问管理接口需要用它' : ''));
+    refresh();
+  } catch (err) { alert('导入失败：' + err.message); }
 };
 
 async function refresh() { try { state = await api('/state'); render(); } catch (e) { console.warn(e); } }
