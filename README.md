@@ -36,7 +36,7 @@ start.bat        （或手动：node server.js）
 | 账号冻结/封禁 | `计费账户已被冻结` / `封禁` / `停用` 等（即便返回 400） | 按 key 级永久问题处理：标记无效并换下一个 key，不会反复撞这把 key |
 | 限流 | 429 / `rate limit` 等 | 该 key 冷却 60 秒（`rateCooldownSec` 可调），冷却时长带 ±25% 抖动 |
 | 网络/5xx | 超时、连接失败 | 连续 3 次失败后冷却 2 分钟 |
-| 单次尝试超时 | 上游连上但 `attemptTimeoutSec`（默认 90s）内不返回响应头 | 按 transient 处理换下一个 key |
+| 单次尝试超时 | 上游连上但 `attemptTimeoutSec`（默认 300s，管理页「尝试超时」可调）内不返回响应头 | 按 transient 处理换下一个 key |
 | 模型不存在 / 400 | `MODEL_NOT_AVAILABLE`、参数错误等 | 不换 key；模型不存在则换下一个平台，参数错误原样返回给客户端 |
 
 规则匹配的是响应文本，各家中转站格式不一也能兜住；实测 tokenrhythm 返回

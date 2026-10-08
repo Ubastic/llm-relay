@@ -57,6 +57,7 @@
     <div class="row">
       <input id="proxy" placeholder="全局出站代理（可留空）" style="width:260px" title="支持 http:// https:// socks5:// socks5h://，账号密码写 user:pass@host:port；对未单独设代理的平台生效">
       <input id="pk" placeholder="proxyKey（客户端访问密钥，可留空）" style="width:250px">
+      <input id="attempt-t" type="number" min="5" step="1" placeholder="尝试超时(秒)" style="width:110px" title="单次上游尝试超过该秒数还没返回响应头，就换下一把 key（默认 300。推理模型非流式较慢时可调大）">
       <button id="btn-settings" class="primary">保存设置</button>
       <button id="btn-add">＋ 添加平台</button>
       <button id="btn-export" title="把全部平台、key 与设置导出为 JSON 文件（内含明文 key，注意保管）">导出配置</button>
@@ -123,7 +124,7 @@ function setInput(sel, v) {
   if (el === document.activeElement || el.dataset.dirty) return;
   el.value = v;
 }
-['#pk', '#proxy'].forEach(sel => $(sel).addEventListener('input', e => { e.target.dataset.dirty = '1'; }));
+['#pk', '#proxy', '#attempt-t'].forEach(sel => $(sel).addEventListener('input', e => { e.target.dataset.dirty = '1'; }));
 function ago(t) { if (!t) return '—'; const s = (Date.now() - t) / 1000 | 0; if (s < 60) return s + '秒前'; if (s < 3600) return (s / 60 | 0) + '分钟前'; if (s < 86400) return (s / 3600 | 0) + '小时前'; return (s / 86400 | 0) + '天前'; }
 const CHIP = { alive: '可用', cooldown: '冷却中', exhausted: '无余额', invalid: '无效', disabled: '已停用' };
 
@@ -134,6 +135,7 @@ function render() {
   $('#h-claude').textContent = 'http://localhost:' + state.port;
   setInput('#pk', state.proxyKey || '');
   setInput('#proxy', state.proxyUrl || '');
+  setInput('#attempt-t', state.attemptTimeoutSec ?? 300);
   $('#stat').textContent = '成功 ' + state.stats.ok + ' / 失败 ' + state.stats.fail;
   $('#platforms').innerHTML = state.platforms.map(platformCard).join('') || '<div class="card sub">还没有平台，点右上角「＋ 添加平台」</div>';
   $('#log tbody').innerHTML = (state.log || []).slice(0, 50).map(r =>
@@ -223,9 +225,9 @@ $('#btn-save-platform').onclick = async () => {
 };
 $('#btn-settings').onclick = async () => {
   try {
-    await api('/settings', { proxyKey: $('#pk').value, proxyUrl: $('#proxy').value });
-    ['#pk', '#proxy'].forEach(sel => $(sel).dataset.dirty = '');
-    alert('已保存，proxyKey / 代理即时生效');
+    await api('/settings', { proxyKey: $('#pk').value, proxyUrl: $('#proxy').value, attemptTimeoutSec: Number($('#attempt-t').value) || undefined });
+    ['#pk', '#proxy', '#attempt-t'].forEach(sel => $(sel).dataset.dirty = '');
+    alert('已保存，proxyKey / 代理 / 超时即时生效');
   } catch (e) { alert(e.message); }
 };
 

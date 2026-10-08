@@ -29,7 +29,7 @@ function loadConfig() {
     if (!Array.isArray(c.platforms)) c.platforms = [];
     return c;
   } catch {
-    const def = { port: 8787, host: '127.0.0.1', proxyKey: '', proxyUrl: '', rateCooldownSec: 60, platforms: [] };
+    const def = { port: 8787, host: '127.0.0.1', proxyKey: '', proxyUrl: '', rateCooldownSec: 60, attemptTimeoutSec: 300, platforms: [] };
     try { fs.writeFileSync(CFG_PATH, JSON.stringify(def, null, 2)); } catch {}
     return def;
   }
@@ -339,7 +339,7 @@ async function handleRelay(req, res, sub) {
       req.on('close', onClose);
       // 单次尝试超时：部分上游“连接活着但不吐数据”，TTFB 可无限挂起（实测 >10 分钟），
       // 且会占满客户端等待。到点中止并按 transient 换下一把 key。
-      const attemptSec = cfg.attemptTimeoutSec || 90;
+      const attemptSec = cfg.attemptTimeoutSec || 300;
       let attemptTimedOut = false;
       const attemptTimer = setTimeout(() => { attemptTimedOut = true; ac.abort(); }, attemptSec * 1000);
 
@@ -507,6 +507,7 @@ function stateView() {
     port: PORT,
     proxyKey: cfg.proxyKey,
     proxyUrl: cfg.proxyUrl || '',
+    attemptTimeoutSec: cfg.attemptTimeoutSec || 300,
     rateCooldownSec: cfg.rateCooldownSec,
     platforms: cfg.platforms.map(p => ({
       id: p.id, name: p.name, baseUrl: p.baseUrl, protocol: p.protocol || 'openai',
@@ -677,8 +678,9 @@ async function handleAdmin(req, res, sub) {
       cfg.proxyUrl = v;
     }
     if (Number.isFinite(body.rateCooldownSec)) cfg.rateCooldownSec = Math.max(5, body.rateCooldownSec);
+    if (Number.isFinite(body.attemptTimeoutSec)) cfg.attemptTimeoutSec = Math.max(5, Math.round(body.attemptTimeoutSec));
     save();
-    return sendJson(res, 200, { ok: true, note: 'proxyKey / 代理即时生效；修改端口请编辑 config.json 后重启' });
+    return sendJson(res, 200, { ok: true, note: 'proxyKey / 代理 / 超时即时生效；修改端口请编辑 config.json 后重启' });
   }
 
   sendJson(res, 404, { error: '未知管理接口 ' + sub });

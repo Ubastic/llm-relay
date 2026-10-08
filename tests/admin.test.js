@@ -78,6 +78,15 @@ const key = (k, status) => ({ key: k, status: status || 'alive', lastError: '', 
     r = await fetch(B + '/admin/api/config/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ platforms: [{ name: 'x', baseUrl: '' }] }) });
     ok(r.status === 400, '平台缺 Base URL 的导入返回 400');
 
+    let s0 = await (await fetch(B + '/admin/api/state')).json();
+    ok(s0.attemptTimeoutSec === 300, 'attemptTimeoutSec 默认 300 秒');
+    await fetch(B + '/admin/api/settings', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ attemptTimeoutSec: 600 }) });
+    s0 = await (await fetch(B + '/admin/api/state')).json();
+    ok(s0.attemptTimeoutSec === 600, '设置接口可修改 attemptTimeoutSec');
+    await fetch(B + '/admin/api/settings', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ attemptTimeoutSec: 1 }) });
+    s0 = await (await fetch(B + '/admin/api/state')).json();
+    ok(s0.attemptTimeoutSec === 5, 'attemptTimeoutSec 下限 5 秒');
+
     console.log(failures ? '\n实例 A 有失败项' : '\n实例 A（导出/导入）全部通过 ✓');
   } catch (e) {
     failures++;
