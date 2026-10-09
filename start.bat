@@ -1,6 +1,5 @@
 @echo off
 chcp 65001 >nul
 cd /d %~dp0
+start "" http://localhost:8787
 node server.js
-timeout /t 1 >nul
-start "" http://localhost:18788
