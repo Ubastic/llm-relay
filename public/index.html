@@ -62,6 +62,7 @@
       <button id="btn-add">＋ 添加平台</button>
       <button id="btn-export" title="把全部平台、key 与设置导出为 JSON 文件（内含明文 key，注意保管）">导出配置</button>
       <button id="btn-import" title="从导出的 JSON 文件恢复，覆盖当前全部设置与平台">导入配置</button>
+      <button id="btn-logout" style="display:none">退出登录</button>
       <input type="file" id="import-file" accept=".json,application/json" style="display:none">
     </div>
   </div>
@@ -69,7 +70,8 @@
   <div class="hint">
     接入：OpenAI 格式（codex / zcode / 各类客户端）→ base_url 填 <code id="h-openai"></code>；
     Claude 格式（Claude Code）→ 环境变量 <code>ANTHROPIC_BASE_URL=<span id="h-claude"></span></code>。
-    模型名照常填写，本服务按模型路由平台、按 key 池轮换。无余额/无效 key 自动剔除并换下一个。
+    模型名照常填写，本服务按模型路由平台、按 key 池轮换。无余额/无效 key 自动剔除并换下一个。<br>
+    调用鉴权：客户端 API key 填 <code>.env</code> 里 <code>API_KEYS</code> 之一（或右上角 proxyKey），请求头 <code>Authorization: Bearer &lt;key&gt;</code> 或 <code>x-api-key</code>。
   </div>
 
   <div class="card editor" id="editor">
@@ -109,9 +111,9 @@ const hdrs = () => { const h = { 'content-type': 'application/json' }; const k =
 async function api(path, body, method) {
   const r = await fetch('/admin/api' + path, { method: method || (body ? 'POST' : 'GET'), headers: hdrs(), body: body ? JSON.stringify(body) : undefined });
   if (r.status === 401) {
-    const k = prompt('请输入访问密钥（proxyKey）');
+    const k = prompt('请输入管理密码（ADMIN_PASSWORD）或 proxyKey');
     if (k != null) { localStorage.setItem('relayAdminKey', k); return api(path, body, method); }
-    throw new Error('需要访问密钥');
+    throw new Error('需要登录');
   }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
@@ -130,7 +132,9 @@ const CHIP = { alive: '可用', cooldown: '冷却中', exhausted: '无余额', i
 
 function render() {
   const nk = state.platforms.reduce((n, p) => n + p.keys.length, 0);
-  $('#sub').textContent = 'http://localhost:' + state.port + ' · ' + state.platforms.length + ' 个平台 · ' + nk + ' 个 key';
+  const authTail = state.auth && state.auth.adminPasswordSet ? ' · 🔐 密码保护' : '';
+  $('#sub').textContent = 'http://localhost:' + state.port + ' · ' + state.platforms.length + ' 个平台 · ' + nk + ' 个 key' + authTail;
+  $('#btn-logout').style.display = state.auth && state.auth.adminPasswordSet ? '' : 'none';
   $('#h-openai').textContent = 'http://localhost:' + state.port + '/v1';
   $('#h-claude').textContent = 'http://localhost:' + state.port;
   setInput('#pk', state.proxyKey || '');
@@ -230,6 +234,7 @@ $('#btn-settings').onclick = async () => {
     alert('已保存，proxyKey / 代理 / 超时即时生效');
   } catch (e) { alert(e.message); }
 };
+$('#btn-logout').onclick = async () => { try { await fetch('/admin/api/logout', { method: 'POST' }); } catch {} localStorage.removeItem('relayAdminKey'); location.href = '/'; };
 
 $('#btn-export').onclick = async () => {
   try {

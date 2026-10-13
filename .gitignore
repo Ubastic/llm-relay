@@ -2,6 +2,12 @@
 config.json
 config-*.json
 
+# 鉴权配置（管理密码 / API key），绝不提交
+.env
+
+# Docker 数据卷挂载点（含 config.json）
+data/
+
 node_modules/
 *.log
 .DS_Store

@@ -1,0 +1,19 @@
+services:
+  llm-relay:
+    build:
+      context: .
+      args:
+        # 基础镜像源：.env 里设 IMAGE_REGISTRY 即可换国内镜像站（默认 docker.io/library）
+        IMAGE_REGISTRY: ${IMAGE_REGISTRY:-docker.io/library}
+    image: llm-relay
+    container_name: llm-relay
+    restart: unless-stopped
+    env_file: .env            # ADMIN_PASSWORD / API_KEYS / RELAY_PORT 等
+    environment:
+      - RELAY_HOST=0.0.0.0    # 容器内必须监听 0.0.0.0（勿改）
+    ports:
+      - "${RELAY_PORT:-8787}:${RELAY_PORT:-8787}"
+    volumes:
+      - relay-data:/data      # config.json（平台与 key 池状态）持久化
+volumes:
+  relay-data:

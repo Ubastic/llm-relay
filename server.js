@@ -11,15 +11,37 @@ const C = require('./convert');
 const PF = require('./proxyFetch');
 
 const ROOT = __dirname;
-// RELAY_CONFIG：自定义配置文件路径（测试用），默认同目录 config.json
-const CFG_PATH = process.env.RELAY_CONFIG ? path.resolve(process.env.RELAY_CONFIG) : path.join(ROOT, 'config.json');
+
+// 本地直接 node 运行时加载 .env（Docker 由 compose env_file 注入，不经过这里）；不覆盖已有环境变量
+(function loadDotEnv() {
+  try {
+    const envPath = path.join(ROOT, '.env');
+    if (!fs.existsSync(envPath)) return;
+    for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+      if (!line || line.trim().startsWith('#')) continue;
+      const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
+      if (!m) continue;
+      let v = m[2].trim();
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+      if (!(m[1] in process.env)) process.env[m[1]] = v;
+    }
+  } catch {}
+})();
+
+// RELAY_CONFIG：自定义配置文件路径（测试用），默认同目录 config.json；
+// RELAY_CONFIG_DIR：配置目录（Docker 里指向 /data 卷），其下放 config.json
+const CFG_PATH = process.env.RELAY_CONFIG ? path.resolve(process.env.RELAY_CONFIG) : path.join(process.env.RELAY_CONFIG_DIR || ROOT, 'config.json');
 const INDEX_PATH = path.join(ROOT, 'public', 'index.html');
 
 const argPort = (() => { const i = process.argv.indexOf('--port'); return i >= 0 ? parseInt(process.argv[i + 1], 10) || null : null; })();
 const envPort = parseInt(process.env.RELAY_PORT, 10) || null;
+const envHost = (process.env.RELAY_HOST || '').trim() || null;
 // RELAY_ADMIN_PASSWORD（或 ADMIN_PASSWORD）：设置后管理页需先用密码登录（Cookie 保持 30 天）；
-// 不设置则和以前一样直接访问。中转端点 /v1/* 不受影响，仍由 proxyKey 控制。
+// 不设置则和以前一样直接访问。
+// API_KEYS：额外接受的中转调用 key（逗号分隔可多个），与 proxyKey 并存，任一命中放行；
+// Docker 部署在 .env 里配置（见 .env.example）。
 const ADMIN_PASSWORD = process.env.RELAY_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || '';
+const EXTRA_API_KEYS = (process.env.API_KEYS || '').split(/[,\n]+/).map(s => s.trim()).filter(Boolean);
 
 /* ---------------- 配置 ---------------- */
 let cfg = loadConfig();
@@ -145,11 +167,19 @@ function safeParse(s) { try { return JSON.parse(s); } catch { return { raw: s };
 function sseHeaders() {
   return { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', 'connection': 'keep-alive', 'x-accel-buffering': 'no' };
 }
+// 合法调用 key：.env 的 API_KEYS（可多个）+ 管理页设置的 proxyKey；
+// 一个都没配则放行所有调用（原行为，本地/自测用；公网部署务必在 .env 配 API_KEYS）
+function validApiKeys() {
+  const set = new Set(EXTRA_API_KEYS);
+  if (cfg.proxyKey) set.add(cfg.proxyKey);
+  return set;
+}
 function checkAuth(req) {
-  if (!cfg.proxyKey) return true;
+  const keys = validApiKeys();
+  if (!keys.size) return true;
   const bearer = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
   const xk = String(req.headers['x-api-key'] || '').trim();
-  return bearer === cfg.proxyKey || xk === cfg.proxyKey;
+  return keys.has(bearer) || keys.has(xk);
 }
 
 /* ---------------- 管理页密码保护 ---------------- */
@@ -172,10 +202,30 @@ function checkAuthToken(t) {
   const expect = authSign(exp);
   return sig.length === expect.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expect));
 }
-// 管理接口鉴权：开了密码门则有效登录 Cookie 直接放行；否则沿用 proxyKey（两者兼容，脚本仍可用 x-admin-key）
+// 管理接口鉴权：开了密码门则有效登录 Cookie 或 x-admin-key（管理密码/proxyKey）放行；
+// 未开密码门则沿用 proxyKey 原行为；两者都没配才直接放行（本地/自测）
 function adminAuthed(req) {
-  if (ADMIN_PASSWORD && checkAuthToken(parseCookies(req).relay_auth)) return true;
-  return !cfg.proxyKey || String(req.headers['x-admin-key'] || '') === cfg.proxyKey;
+  const k = String(req.headers['x-admin-key'] || '').trim();
+  if (ADMIN_PASSWORD) {
+    if (checkAuthToken(parseCookies(req).relay_auth)) return true;
+    if (k && k.length === ADMIN_PASSWORD.length && crypto.timingSafeEqual(Buffer.from(k), Buffer.from(ADMIN_PASSWORD))) return true;
+    return cfg.proxyKey ? k === cfg.proxyKey : false;
+  }
+  return !cfg.proxyKey || k === cfg.proxyKey;
+}
+
+// 登录爆破限速：单 IP 10 分钟窗口最多 10 次失败
+const loginFails = new Map();
+function loginLimited(ip) {
+  const e = loginFails.get(ip);
+  return !!(e && Date.now() <= e.resetAt && e.n >= 10);
+}
+function noteLoginFail(ip) {
+  const e = loginFails.get(ip) || { n: 0, resetAt: 0 };
+  if (Date.now() > e.resetAt) { e.n = 0; e.resetAt = Date.now() + 10 * 60 * 1000; }
+  e.n++;
+  loginFails.set(ip, e);
+  return 10 - e.n;
 }
 
 /* ---------------- 出站代理 ---------------- */
@@ -289,7 +339,7 @@ async function handleRelay(req, res, sub) {
   const passthroughOnly = sub === '/responses' || sub === '/embeddings' || sub === '/completions';
   const raw = (await readBody(req)).toString('utf8');
 
-  if (!checkAuth(req)) return sendJson(res, 401, fmtError(incoming, 401, '访问密钥不正确：客户端请填入本服务设置的 proxyKey', 'authentication_error'));
+  if (!checkAuth(req)) return sendJson(res, 401, fmtError(incoming, 401, '需要 API key：请在请求头携带 Authorization: Bearer <key> 或 x-api-key: <key>（key 为 .env 中 API_KEYS 之一，或管理页设置的 proxyKey）', 'authentication_error'));
 
   let body;
   try { body = JSON.parse(raw || '{}'); } catch { return sendJson(res, 400, fmtError(incoming, 400, '请求体不是合法 JSON', 'invalid_request_error')); }
@@ -506,6 +556,7 @@ function stateView() {
   return {
     port: PORT,
     proxyKey: cfg.proxyKey,
+    auth: { adminPasswordSet: !!ADMIN_PASSWORD, apiKeysConfigured: validApiKeys().size },
     proxyUrl: cfg.proxyUrl || '',
     attemptTimeoutSec: cfg.attemptTimeoutSec || 300,
     rateCooldownSec: cfg.rateCooldownSec,
@@ -558,16 +609,26 @@ async function testKey(p, k) {
 async function handleAdmin(req, res, sub) {
   const body = await readBody(req).then(b => { try { return JSON.parse(b.toString('utf8') || '{}'); } catch { return {}; } }).catch(() => ({}));
 
-  // 登录：无需已有凭证；密码错误延迟返回，拖慢爆破
+  // 登录：无需已有凭证；限速 + 密码错误延迟返回，拖慢爆破
   if (req.method === 'POST' && sub === '/login') {
     if (!ADMIN_PASSWORD) return sendJson(res, 400, { error: '未开启密码保护（设置环境变量 RELAY_ADMIN_PASSWORD）' });
+    const ip = req.socket.remoteAddress || '?';
+    if (loginLimited(ip)) return sendJson(res, 429, { error: '失败次数过多，请 10 分钟后再试' });
     const pw = String(body.password || '');
     const same = pw.length === ADMIN_PASSWORD.length && crypto.timingSafeEqual(Buffer.from(pw), Buffer.from(ADMIN_PASSWORD));
     if (!same) {
       await new Promise(r => setTimeout(r, 800));
-      return sendJson(res, 401, { error: '密码错误' });
+      const left = noteLoginFail(ip);
+      return sendJson(res, 401, { error: '密码错误' + (left > 0 ? '（剩余 ' + left + ' 次尝试）' : '') });
     }
+    loginFails.delete(ip);
     res.setHeader('set-cookie', 'relay_auth=' + makeAuthToken() + '; Path=/; HttpOnly; Max-Age=' + 30 * 86400 + '; SameSite=Strict');
+    return sendJson(res, 200, { ok: true });
+  }
+
+  // 登出：清除登录 Cookie
+  if (req.method === 'POST' && sub === '/logout') {
+    res.setHeader('set-cookie', 'relay_auth=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0');
     return sendJson(res, 200, { ok: true });
   }
 
@@ -688,7 +749,7 @@ async function handleAdmin(req, res, sub) {
 
 /* ---------------- HTTP 服务 ---------------- */
 const PORT = argPort || envPort || cfg.port || 8787;
-const HOST = cfg.host || '127.0.0.1';
+const HOST = envHost || cfg.host || '127.0.0.1'; // RELAY_HOST 环境变量优先（Docker 里必须 0.0.0.0）
 
 const LOGIN_HTML = `<!doctype html>
 <html lang="zh-CN">
@@ -773,11 +834,14 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   const nk = cfg.platforms.reduce((n, p) => n + (p.keys || []).length, 0);
   const px = String(cfg.proxyUrl || '').trim();
+  const nKeys = validApiKeys().size;
   console.log('');
   console.log('  LLM Key 中转池 已启动');
-  console.log('  管理页       http://localhost:' + PORT + '/');
+  console.log('  监听         ' + HOST + ':' + PORT);
+  console.log('  管理页       http://localhost:' + PORT + '/' + (ADMIN_PASSWORD ? '（需密码登录）' : '（未设 ADMIN_PASSWORD，无登录保护）'));
   console.log('  OpenAI 端点  http://localhost:' + PORT + '/v1   （base_url 填这个）');
   console.log('  Claude 端点  http://localhost:' + PORT + '       （ANTHROPIC_BASE_URL 填这个）');
+  console.log('  调用鉴权     ' + (nKeys ? '已启用，' + nKeys + ' 个可用 key（Bearer / x-api-key）' : '未配置任何 key，放行所有调用（本地/自测用；公网部署请在 .env 配 API_KEYS）'));
   console.log('  当前 ' + cfg.platforms.length + ' 个平台 / ' + nk + ' 个 key' + (px ? ' / 全局出站代理 ' + px : ''));
   console.log('');
 });

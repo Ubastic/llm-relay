@@ -1,0 +1,13 @@
+# 含明文 key，绝不打进镜像
+config.json
+.env
+data/
+.git/
+tests/
+node_modules/
+*.log
+*.bat
+README.md
+.dockerignore
+Dockerfile
+docker-compose.yml
