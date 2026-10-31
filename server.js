@@ -129,10 +129,13 @@ function markKey(p, k, type, msg) {
 function coolAt(ms) { return Date.now() + Math.round(ms * (0.75 + Math.random() * 0.5)); }
 
 /* ---------------- 工具 ---------------- */
-function joinBase(base, sub) {
+// autoV1：地址尾部没有版本段（/v1、/v2beta…）时是否自动补 /v1。
+// anthropic 上游保持自动补（官方 API 恒为 /v1/messages）；openai 上游不补，
+// baseUrl 原样拼接——不少 OpenAI 兼容网关的路径本身不含版本段（如 /api/chat/completions）。
+function joinBase(base, sub, autoV1) {
   let b = String(base || '').trim().replace(/\/+$/, '');
   if (!/^https?:\/\//i.test(b)) b = 'http://' + b;
-  if (/\/v\d+([a-z]*)?$/i.test(b)) return b + sub;
+  if (autoV1 === false || /\/v\d+([a-z]*)?$/i.test(b)) return b + sub;
   return b + '/v1' + sub;
 }
 function sendJson(res, status, obj) {
@@ -378,8 +381,8 @@ async function handleRelay(req, res, sub) {
         if (req.headers['anthropic-beta']) headers['anthropic-beta'] = String(req.headers['anthropic-beta']);
         bodyStr = incoming === 'anthropic' ? raw : JSON.stringify(C.openaiReqToAnthropic(body));
       } else {
-        // OpenAI 上游：anthropic 入站（协议转换）固定走 /chat/completions；openai 入站（透传）跟随原始路径
-        url = joinBase(p.baseUrl, incoming === 'anthropic' ? '/chat/completions' : sub);
+        // OpenAI 上游：anthropic 入站（协议转换）固定走 /chat/completions；openai 入站（透传）跟随原始路径。不自动补 /v1
+        url = joinBase(p.baseUrl, incoming === 'anthropic' ? '/chat/completions' : sub, false);
         headers = { 'content-type': 'application/json', 'authorization': 'Bearer ' + k.key };
         bodyStr = incoming === 'openai' ? raw : JSON.stringify(C.anthropicReqToOpenai(body));
       }
@@ -537,7 +540,7 @@ async function handleModels(req, res) {
         const headers = proto === 'anthropic'
           ? { 'x-api-key': k.key, 'anthropic-version': '2023-06-01' }
           : { 'authorization': 'Bearer ' + k.key };
-        const r = await uFetch(joinBase(p.baseUrl, '/models'), { headers, signal: AbortSignal.timeout(15000) }, p);
+        const r = await uFetch(joinBase(p.baseUrl, '/models', proto === 'anthropic'), { headers, signal: AbortSignal.timeout(15000) }, p);
         if (!r.ok) continue;
         const j = await r.json();
         for (const m of (j.data || j.models || [])) if (m && m.id) out.set(String(m.id), { id: String(m.id), object: 'model', owned_by: p.name });
@@ -590,7 +593,7 @@ async function testKey(p, k) {
     headers = { 'content-type': 'application/json', 'x-api-key': k.key, 'anthropic-version': '2023-06-01' };
     bodyStr = JSON.stringify({ model, max_tokens: 4, messages: [{ role: 'user', content: 'hi' }] });
   } else {
-    url = joinBase(p.baseUrl, '/chat/completions');
+    url = joinBase(p.baseUrl, '/chat/completions', false);
     headers = { 'content-type': 'application/json', 'authorization': 'Bearer ' + k.key };
     bodyStr = JSON.stringify({ model, max_tokens: 4, messages: [{ role: 'user', content: 'hi' }] });
   }
